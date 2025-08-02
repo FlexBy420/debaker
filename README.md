@@ -1,3 +1,8 @@
+# Usage:
+```
+py debaker.py unpack <input_file.bin> [output_dir] [--debug]
+py debaker.py repack <input_dir> [output_file.bin] [--debug]
+```
 # Known Issues:
 * Repacker does not yet work.
 # Known Working Games (Unpack):
