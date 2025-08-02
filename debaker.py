@@ -29,7 +29,6 @@ class CoalescedTool:
         else:
             length_bytes = raw_len
             style = "POS"
-
         if self.debug:
             print(f"[DEBUG] Name length raw={raw_len} style={style} bytes={length_bytes}")
         return length_bytes
@@ -42,7 +41,6 @@ class CoalescedTool:
         else:
             val_len = raw_len
             style = "POS"
-
         if self.debug:
             print(f"[DEBUG] Value length raw={raw_len} style={style} chars={val_len}")
         return val_len
@@ -63,10 +61,8 @@ class CoalescedTool:
                 self.nmlen = self.read_name_length_be(f)
                 name_bytes = f.read(self.nmlen)
                 self.fullpath = self.decode_name(name_bytes)
-
                 if self.debug:
                     print(f"[DEBUG] files={self.files}, fullpath={self.fullpath}")
-
                 if self.files == 0 or self.files > 10000:
                     print("Probably not a Coalesced file.")
                     return False
@@ -76,8 +72,14 @@ class CoalescedTool:
             return False
 
     def unpack(self, input_file, output_dir=None):
-        if not output_dir:
-            output_dir = os.path.splitext(os.path.basename(input_file))[0]
+        bin_name = os.path.splitext(os.path.basename(input_file))[0]
+
+        # Always create a bin_name subfolder
+        if output_dir is None:
+            base_folder = os.path.dirname(input_file)
+            output_dir = os.path.join(base_folder, bin_name)
+        else:
+            output_dir = os.path.join(output_dir, bin_name)
 
         os.makedirs(output_dir, exist_ok=True)
 
@@ -91,12 +93,19 @@ class CoalescedTool:
                     return
 
                 self.fullpath = self.decode_name(f.read(self.nmlen))
-                f.seek(2, os.SEEK_CUR)  # Skip null terminator (2 bytes)
+                f.seek(2, os.SEEK_CUR)  # skip null terminator
 
                 self.secCount = self.read_int_be(f)
 
                 if self.nmlen > 0:
-                    clean_path = self.fullpath.replace('..\\..\\', '')
+                    normalized_path = self.fullpath.replace('/', '\\')
+
+                    # Strip all leading "../" or "..\"
+                    while normalized_path.startswith('..\\') or normalized_path.startswith('../'):
+                        parts = normalized_path.split('\\', 1) if '\\' in normalized_path else normalized_path.split('/', 1)
+                        normalized_path = parts[1] if len(parts) > 1 else ''
+
+                    clean_path = normalized_path.lstrip('\\/')
                     full_output_path = os.path.join(output_dir, clean_path)
                     os.makedirs(os.path.dirname(full_output_path), exist_ok=True)
 
@@ -129,7 +138,6 @@ class CoalescedTool:
                                         else:
                                             value_chars.append(char_bytes.decode('utf-16le'))
                                     f.seek(2, os.SEEK_CUR)  # skip null terminator
-
                                     value = ''.join(value_chars).rstrip('\r\n')
                                     out_file.write(value)
 
@@ -232,7 +240,6 @@ def main():
     elif command == "repack":
         input_dir = sys.argv[2]
         output_file = sys.argv[3] if len(sys.argv) > 3 else None
-
         print(f"Repacking {input_dir}...")
         tool.repack(input_dir, output_file)
         print("Repacking completed!")
