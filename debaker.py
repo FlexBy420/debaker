@@ -16,7 +16,7 @@ class CoalescedTool:
         data = f.read(4)
         if len(data) < 4:
             raise EOFError("Unexpected EOF while reading int")
-        val = struct.unpack('>i', data)[0]
+        val = struct.unpack(">i", data)[0]
         if self.debug:
             print(f"[DEBUG] read_int_be: {val}")
         return val
@@ -47,16 +47,16 @@ class CoalescedTool:
 
     def decode_name(self, name_bytes):
         try:
-            return name_bytes.decode('utf-16le')
+            return name_bytes.decode("utf-16le")
         except UnicodeDecodeError:
             try:
-                return name_bytes.decode('latin-1')
+                return name_bytes.decode("latin-1")
             except UnicodeDecodeError:
-                return name_bytes.decode('utf-8', errors='replace')
+                return name_bytes.decode("utf-8", errors="replace")
 
     def validate_coalesced(self, file_path):
         try:
-            with open(file_path, 'rb') as f:
+            with open(file_path, "rb") as f:
                 self.files = self.read_int_be(f)
                 self.nmlen = self.read_name_length_be(f)
                 name_bytes = f.read(self.nmlen)
@@ -83,7 +83,7 @@ class CoalescedTool:
 
         os.makedirs(output_dir, exist_ok=True)
 
-        with open(input_file, 'rb') as f:
+        with open(input_file, "rb") as f:
             self.files = self.read_int_be(f)
 
             for file_index in range(self.files):
@@ -98,32 +98,36 @@ class CoalescedTool:
                 self.secCount = self.read_int_be(f)
 
                 if self.nmlen > 0:
-                    normalized_path = self.fullpath.replace('/', '\\')
+                    normalized_path = self.fullpath.replace("/", "\\")
 
                     # Strip all leading "../" or "..\"
-                    while normalized_path.startswith('..\\') or normalized_path.startswith('../'):
-                        parts = normalized_path.split('\\', 1) if '\\' in normalized_path else normalized_path.split('/', 1)
-                        normalized_path = parts[1] if len(parts) > 1 else ''
+                    while normalized_path.startswith("..\\") or normalized_path.startswith("../"):
+                        parts = (
+                            normalized_path.split("\\", 1)
+                            if "\\" in normalized_path
+                            else normalized_path.split("/", 1)
+                        )
+                        normalized_path = parts[1] if len(parts) > 1 else ""
 
-                    clean_path = normalized_path.lstrip('\\/')
+                    clean_path = normalized_path.lstrip("\\/")
                     full_output_path = os.path.join(output_dir, clean_path)
                     os.makedirs(os.path.dirname(full_output_path), exist_ok=True)
 
-                    with open(full_output_path, 'w', encoding='utf-8') as out_file:
+                    with open(full_output_path, "w", encoding="utf-8") as out_file:
                         for sec_index in range(self.secCount):
                             sec_name_len = self.read_name_length_be(f)
                             sec_name_bytes = f.read(sec_name_len)
-                            section_name = sec_name_bytes.decode('utf-16le')
+                            section_name = sec_name_bytes.decode("utf-16le")
                             f.seek(2, os.SEEK_CUR)  # skip null terminator
 
-                            out_file.write(f'[{section_name}]\n')
+                            out_file.write(f"[{section_name}]\n")
 
                             self.recCount = self.read_int_be(f)
 
                             for _ in range(self.recCount):
                                 key_name_len = self.read_name_length_be(f)
                                 key_name_bytes = f.read(key_name_len)
-                                key_name = key_name_bytes.decode('utf-16le')
+                                key_name = key_name_bytes.decode("utf-16le")
                                 f.seek(2, os.SEEK_CUR)  # skip null terminator
 
                                 out_file.write(f"{key_name}=")
@@ -133,83 +137,94 @@ class CoalescedTool:
                                     value_chars = []
                                     for _ in range(self.valueLength):
                                         char_bytes = f.read(2)
-                                        if char_bytes == b'\n\x00':
-                                            value_chars.append('\u00B6')  # ¶ symbol
+                                        if char_bytes == b"\n\x00":
+                                            value_chars.append("\u00B6")  # ¶ symbol
                                         else:
-                                            value_chars.append(char_bytes.decode('utf-16le'))
+                                            value_chars.append(char_bytes.decode("utf-16le"))
                                     f.seek(2, os.SEEK_CUR)  # skip null terminator
-                                    value = ''.join(value_chars).rstrip('\r\n')
+                                    value = "".join(value_chars).rstrip("\r\n")
                                     out_file.write(value)
 
-                                out_file.write('\n')
+                                out_file.write("\n")
 
                             if sec_index != self.secCount - 1:
-                                out_file.write('\n')
+                                out_file.write("\n")
 
     def repack(self, input_dir, output_file=None):
         if not output_file:
-            output_file = os.path.join(input_dir, os.path.basename(input_dir) + '.bin')
+            output_file = os.path.join(
+                os.path.dirname(input_dir),
+                os.path.basename(input_dir) + ".BIN"
+            )
 
+        # Gather extracted files
         input_files = []
         for root, _, files in os.walk(input_dir):
             for file in files:
                 rel_path = os.path.relpath(os.path.join(root, file), input_dir)
-                input_files.append(rel_path.replace('\\', '\\'))
+                input_files.append(rel_path)
 
         self.files = len(input_files)
 
-        with open(output_file, 'wb') as out_f:
-            out_f.write(struct.pack('>i', self.files))
+        with open(output_file, "wb") as out_f:
+            # File count
+            out_f.write(struct.pack(">i", self.files))
 
             for rel_path in input_files:
                 full_input_path = os.path.join(input_dir, rel_path)
-                bin_path = '..\\..\\' + rel_path.replace('/', '\\')
 
-                name_len = len(bin_path)
-                out_f.write(struct.pack('>i', -(name_len + 1)))
-                out_f.write(bin_path.encode('utf-16le'))
-                out_f.write(b'\x00\x00')
+                # UE3 uses ..\..\ prefix
+                bin_path = "..\\..\\" + rel_path.replace("/", "\\")
 
-                with open(full_input_path, 'rb') as in_f:
-                    content = in_f.read().decode('utf-16le', errors='replace')
+                # File name length
+                out_f.write(struct.pack(">i", -(len(bin_path) + 1)))
+                out_f.write(bin_path.encode("utf-16le"))
+                out_f.write(b"\x00\x00")
 
-                sections = content.split('\r\n\r\n')
-                self.secCount = len([s for s in sections if s.strip()])
-                out_f.write(struct.pack('>i', self.secCount))
+                # Parse ini file into sections and records
+                sections = []
+                current_section = None
+                current_records = []
 
-                for section in sections:
-                    if not section.strip():
-                        continue
+                with open(full_input_path, "r", encoding="utf-8") as ini_f:
+                    for line in ini_f:
+                        line = line.rstrip("\n").rstrip("\r")
+                        if line.startswith("[") and line.endswith("]"):
+                            if current_section is not None:
+                                sections.append((current_section, current_records))
+                                current_records = []
+                            current_section = line[1:-1]
+                        elif "=" in line:
+                            key, value = line.split("=", 1)
+                            value = value.replace("¶", "\n")
+                            current_records.append((key, value))
+                        elif not line.strip():
+                            continue
 
-                    lines = section.split('\r\n')
-                    if not lines:
-                        continue
+                    if current_section is not None:
+                        sections.append((current_section, current_records))
 
-                    section_header = lines[0]
-                    if section_header.startswith('[') and section_header.endswith(']'):
-                        section_name = section_header[1:-1]
-                        name_len = len(section_name)
-                        out_f.write(struct.pack('>i', -(name_len + 1)))
-                        out_f.write(section_name.encode('utf-16le'))
-                        out_f.write(b'\x00\x00')
+                # Section count
+                out_f.write(struct.pack(">i", len(sections)))
 
-                        records = [line for line in lines[1:] if '=' in line]
-                        self.recCount = len(records)
-                        out_f.write(struct.pack('>i', self.recCount))
+                for section_name, records in sections:
+                    # Section name length
+                    out_f.write(struct.pack(">i", -(len(section_name) + 1)))
+                    out_f.write(section_name.encode("utf-16le"))
+                    out_f.write(b"\x00\x00")
 
-                        for record in records:
-                            key, value = record.split('=', 1)
-                            name_len = len(key)
-                            out_f.write(struct.pack('>i', -(name_len + 1)))
-                            out_f.write(key.encode('utf-16le'))
-                            out_f.write(b'\x00\x00')
+                    # Record count
+                    out_f.write(struct.pack(">i", len(records)))
 
-                            value = value.replace('¶', '\n')
-                            value_len = len(value)
-                            out_f.write(struct.pack('>i', -(value_len + 1)))
-                            for char in value:
-                                out_f.write(char.encode('utf-16le'))
-                            out_f.write(b'\x00\x00')
+                    for key, value in records:
+                        # Key name length
+                        out_f.write(struct.pack(">i", -(len(key) + 1)))
+                        out_f.write(key.encode("utf-16le"))
+                        out_f.write(b"\x00\x00")
+                        # Value length
+                        out_f.write(struct.pack(">i", -(len(value) + 1)))
+                        out_f.write(value.encode("utf-16le"))
+                        out_f.write(b"\x00\x00")
 
 def main():
     if len(sys.argv) < 3:
@@ -218,9 +233,9 @@ def main():
         print("  To repack: py debaker.py repack <input_dir> [output_file.bin] [--debug]")
         return
 
-    debug = '--debug' in sys.argv
+    debug = "--debug" in sys.argv
     if debug:
-        sys.argv.remove('--debug')
+        sys.argv.remove("--debug")
 
     tool = CoalescedTool(debug=debug)
     command = sys.argv[1].lower()
