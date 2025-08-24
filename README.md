@@ -11,6 +11,7 @@ py debaker.py repack <input_dir> [output_file.bin] [--debug]
 * Aliens: Colonial Marines (PS3)
 * Batman: Arkham Asylum (PS3)
 * Batman: Arkham City (PS3)
+* Borderlands (PS3)
 * Black Knight Sword (PS3)
 * Contrast (PS3)
 * Enslaved: Odyssey to the West (PS3)
@@ -20,3 +21,4 @@ py debaker.py repack <input_dir> [output_file.bin] [--debug]
 # Known Working Games (Repack)
 * Batman: Arkham City (PS3)
 * Contrast (PS3)
+* Killer is Dead (PS3)
