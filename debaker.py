@@ -25,13 +25,15 @@ class CoalescedTool:
         raw_len = self.read_int_be(f)
         if raw_len < 0:
             length_bytes = (-raw_len - 1) * 2
+            has_null = True
             style = "NEG"
         else:
             length_bytes = raw_len
+            has_null = False
             style = "POS"
         if self.debug:
             print(f"[DEBUG] Name length raw={raw_len} style={style} bytes={length_bytes}")
-        return length_bytes
+        return length_bytes, has_null
 
     def read_value_length_be(self, f):
         raw_len = self.read_int_be(f)
@@ -58,7 +60,7 @@ class CoalescedTool:
         try:
             with open(file_path, "rb") as f:
                 self.files = self.read_int_be(f)
-                self.nmlen = self.read_name_length_be(f)
+                self.nmlen, _ = self.read_name_length_be(f)
                 name_bytes = f.read(self.nmlen)
                 self.fullpath = self.decode_name(name_bytes)
                 if self.debug:
@@ -88,13 +90,14 @@ class CoalescedTool:
             self.files = self.read_int_be(f)
 
             for file_index in range(self.files):
-                self.nmlen = self.read_name_length_be(f)
+                self.nmlen, nm_has_null = self.read_name_length_be(f)
                 if self.nmlen < 1:
                     print(f"File name error at position {f.tell()}")
                     return
 
                 self.fullpath = self.decode_name(f.read(self.nmlen))
-                f.seek(2, os.SEEK_CUR)  # skip null terminator
+                if nm_has_null:
+                    f.seek(2, os.SEEK_CUR)  # skip null terminator
 
                 self.secCount = self.read_int_be(f)
 
@@ -116,20 +119,22 @@ class CoalescedTool:
 
                     with open(full_output_path, "w", encoding="utf-8") as out_file:
                         for sec_index in range(self.secCount):
-                            sec_name_len = self.read_name_length_be(f)
+                            sec_name_len, sec_has_null = self.read_name_length_be(f)
                             sec_name_bytes = f.read(sec_name_len)
                             section_name = sec_name_bytes.decode("utf-16le")
-                            f.seek(2, os.SEEK_CUR)  # skip null terminator
+                            if sec_has_null:
+                                f.seek(2, os.SEEK_CUR)  # skip null terminator
 
                             out_file.write(f"[{section_name}]\n")
 
                             self.recCount = self.read_int_be(f)
 
                             for _ in range(self.recCount):
-                                key_name_len = self.read_name_length_be(f)
+                                key_name_len, key_has_null = self.read_name_length_be(f)
                                 key_name_bytes = f.read(key_name_len)
-                                key_name = key_name_bytes.decode("utf-16le")
-                                f.seek(2, os.SEEK_CUR)  # skip null terminator
+                                key_name = key_name_bytes.decode("utf-16le") if key_name_len > 0 else ""
+                                if key_has_null:
+                                    f.seek(2, os.SEEK_CUR)  # skip null terminator
 
                                 out_file.write(f"{key_name}=")
 
@@ -241,10 +246,15 @@ class CoalescedTool:
                     out_f.write(struct.pack(">i", len(records)))
 
                     for key, value in records:
-                        # Key name length (NEG encoding)
-                        out_f.write(struct.pack(">i", -(len(key) + 1)))
-                        out_f.write(key.encode("utf-16le"))
-                        out_f.write(b"\x00\x00")
+                        # Key name length:
+                        # empty key = POS 0 (no data, no null terminator)
+                        # non-empty  = NEG encoding + UTF-16LE data + null terminator
+                        if len(key) == 0:
+                            out_f.write(struct.pack(">i", 0))
+                        else:
+                            out_f.write(struct.pack(">i", -(len(key) + 1)))
+                            out_f.write(key.encode("utf-16le"))
+                            out_f.write(b"\x00\x00")
                         # Value length:
                         # empty   = POS 0, no null terminator
                         # nonzero = NEG encoding + data + null terminator
