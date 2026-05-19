@@ -11,6 +11,7 @@ class CoalescedTool:
         self.valueLength = 0
         self.fullpath = ""
         self.debug = debug
+        self.ascii_format = False
 
     def read_int_be(self, f):
         data = f.read(4)
@@ -35,6 +36,25 @@ class CoalescedTool:
             print(f"[DEBUG] Name length raw={raw_len} style={style} bytes={length_bytes}")
         return length_bytes, has_null
 
+    def read_string_be(self, f):
+        raw_len = self.read_int_be(f)
+        if raw_len == 0:
+            return ""
+        if raw_len < 0:
+            # NEG / UTF-16LE: char count = -raw_len - 1, followed by 2-byte null
+            n_chars = -raw_len - 1
+            data = f.read(n_chars * 2)
+            f.read(2)  # skip 2-byte null terminator
+            if self.debug:
+                print(f"[DEBUG] string NEG n_chars={n_chars} data={data[:20]}")
+            return data.decode("utf-16le")
+        else:
+            # POS / ASCII: byte count includes null terminator
+            data = f.read(raw_len)
+            if self.debug:
+                print(f"[DEBUG] string POS raw_len={raw_len} data={data[:20]}")
+            return data.rstrip(b"\x00").decode("latin-1")
+
     def read_value_length_be(self, f):
         raw_len = self.read_int_be(f)
         if raw_len < 0:
@@ -46,6 +66,32 @@ class CoalescedTool:
         if self.debug:
             print(f"[DEBUG] Value length raw={raw_len} style={style} chars={val_len}")
         return val_len
+
+    def read_value_be(self, f):
+        raw_len = self.read_int_be(f)
+        if raw_len == 0:
+            return ""
+        if raw_len < 0:
+            # NEG / UTF-16LE: original char-by-char path (preserves embedded newline escaping)
+            val_len = -raw_len - 1
+            value_chars = []
+            for _ in range(val_len):
+                char_bytes = f.read(2)
+                if char_bytes == b"\n\x00":
+                    value_chars.append("\u00B6")
+                elif char_bytes == b"\r\x00":
+                    value_chars.append("\u00B5")
+                else:
+                    value_chars.append(char_bytes.decode("utf-16le"))
+            f.read(2)  # skip null terminator
+            return "".join(value_chars).rstrip("\r\n")
+        else:
+            # POS / ASCII: byte count includes null terminator
+            data = f.read(raw_len)
+            text = data.rstrip(b"\x00").decode("latin-1")
+            # Escape embedded newlines so the INI line stays single-line
+            text = text.replace("\r", "\u00B5").replace("\n", "\u00B6")
+            return text
 
     def decode_name(self, name_bytes):
         try:
@@ -60,11 +106,22 @@ class CoalescedTool:
         try:
             with open(file_path, "rb") as f:
                 self.files = self.read_int_be(f)
-                self.nmlen, _ = self.read_name_length_be(f)
-                name_bytes = f.read(self.nmlen)
-                self.fullpath = self.decode_name(name_bytes)
+                # Peek at the first name-length to determine encoding format:
+                # POS = ASCII/Latin-1 (byte count incl. null)
+                # NEG = UTF-16LE     (char count excl. null)
+                first_len = self.read_int_be(f)
+                self.ascii_format = (first_len > 0)
                 if self.debug:
-                    print(f"[DEBUG] files={self.files}, fullpath={self.fullpath}")
+                    print(f"[DEBUG] files={self.files}, first_len={first_len}, ascii_format={self.ascii_format}")
+                if self.ascii_format:
+                    name_bytes = f.read(first_len)
+                    self.fullpath = name_bytes.rstrip(b"\x00").decode("latin-1")
+                else:
+                    self.nmlen = (-first_len - 1) * 2
+                    name_bytes = f.read(self.nmlen)
+                    self.fullpath = self.decode_name(name_bytes)
+                if self.debug:
+                    print(f"[DEBUG] fullpath={self.fullpath}")
                 if self.files == 0 or self.files > 10000:
                     print("Probably not a Coalesced file.")
                     return False
@@ -89,15 +146,22 @@ class CoalescedTool:
         with open(input_file, "rb") as f:
             self.files = self.read_int_be(f)
 
-            for file_index in range(self.files):
-                self.nmlen, nm_has_null = self.read_name_length_be(f)
-                if self.nmlen < 1:
-                    print(f"File name error at position {f.tell()}")
-                    return
+            # Write format flag as first line so repack knows which encoding to use
+            with open(manifest_path, "w", encoding="utf-8") as manifest:
+                manifest.write(f"#format={'ascii' if self.ascii_format else 'utf16'}\n")
 
-                self.fullpath = self.decode_name(f.read(self.nmlen))
-                if nm_has_null:
-                    f.seek(2, os.SEEK_CUR)  # skip null terminator
+            for file_index in range(self.files):
+                if self.ascii_format:
+                    self.fullpath = self.read_string_be(f)
+                    self.nmlen = len(self.fullpath)
+                else:
+                    self.nmlen, nm_has_null = self.read_name_length_be(f)
+                    if self.nmlen < 1:
+                        print(f"File name error at position {f.tell()}")
+                        return
+                    self.fullpath = self.decode_name(f.read(self.nmlen))
+                    if nm_has_null:
+                        f.seek(2, os.SEEK_CUR)  # skip null terminator
 
                 self.secCount = self.read_int_be(f)
 
@@ -119,41 +183,46 @@ class CoalescedTool:
 
                     with open(full_output_path, "w", encoding="utf-8") as out_file:
                         for sec_index in range(self.secCount):
-                            sec_name_len, sec_has_null = self.read_name_length_be(f)
-                            sec_name_bytes = f.read(sec_name_len)
-                            section_name = sec_name_bytes.decode("utf-16le")
-                            if sec_has_null:
-                                f.seek(2, os.SEEK_CUR)  # skip null terminator
+                            if self.ascii_format:
+                                section_name = self.read_string_be(f)
+                            else:
+                                sec_name_len, sec_has_null = self.read_name_length_be(f)
+                                sec_name_bytes = f.read(sec_name_len)
+                                section_name = sec_name_bytes.decode("utf-16le")
+                                if sec_has_null:
+                                    f.seek(2, os.SEEK_CUR)  # skip null terminator
 
                             out_file.write(f"[{section_name}]\n")
 
                             self.recCount = self.read_int_be(f)
 
                             for _ in range(self.recCount):
-                                key_name_len, key_has_null = self.read_name_length_be(f)
-                                key_name_bytes = f.read(key_name_len)
-                                key_name = key_name_bytes.decode("utf-16le") if key_name_len > 0 else ""
-                                if key_has_null:
-                                    f.seek(2, os.SEEK_CUR)  # skip null terminator
+                                if self.ascii_format:
+                                    key_name = self.read_string_be(f)
+                                    value = self.read_value_be(f)
+                                else:
+                                    key_name_len, key_has_null = self.read_name_length_be(f)
+                                    key_name_bytes = f.read(key_name_len)
+                                    key_name = key_name_bytes.decode("utf-16le") if key_name_len > 0 else ""
+                                    if key_has_null:
+                                        f.seek(2, os.SEEK_CUR)  # skip null terminator
 
-                                out_file.write(f"{key_name}=")
+                                    self.valueLength = self.read_value_length_be(f)
+                                    value = ""
+                                    if self.valueLength > 0:
+                                        value_chars = []
+                                        for _ in range(self.valueLength):
+                                            char_bytes = f.read(2)
+                                            if char_bytes == b"\n\x00":
+                                                value_chars.append("\u00B6")  # ¶ = embedded newline
+                                            elif char_bytes == b"\r\x00":
+                                                value_chars.append("\u00B5")  # µ = embedded carriage return
+                                            else:
+                                                value_chars.append(char_bytes.decode("utf-16le"))
+                                        f.seek(2, os.SEEK_CUR)  # skip null terminator
+                                        value = "".join(value_chars).rstrip("\r\n")
 
-                                self.valueLength = self.read_value_length_be(f)
-                                if self.valueLength > 0:
-                                    value_chars = []
-                                    for _ in range(self.valueLength):
-                                        char_bytes = f.read(2)
-                                        if char_bytes == b"\n\x00":
-                                            value_chars.append("\u00B6")  # ¶ = embedded newline
-                                        elif char_bytes == b"\r\x00":
-                                            value_chars.append("\u00B5")  # µ = embedded carriage return
-                                        else:
-                                            value_chars.append(char_bytes.decode("utf-16le"))
-                                    f.seek(2, os.SEEK_CUR)  # skip null terminator
-                                    value = "".join(value_chars).rstrip("\r\n")
-                                    out_file.write(value)
-
-                                out_file.write("\n")
+                                out_file.write(f"{key_name}={value}\n")
 
                             if sec_index != self.secCount - 1:
                                 out_file.write("\n")
@@ -169,9 +238,13 @@ class CoalescedTool:
         manifest_path = os.path.join(input_dir, "_manifest.txt")
         if os.path.exists(manifest_path):
             entries = []
+            manifest_ascii = self.ascii_format  # default: match validate-time detection
             with open(manifest_path, "r", encoding="utf-8") as mf:
                 for line in mf:
                     line = line.rstrip("\n")
+                    if line.startswith("#format="):
+                        manifest_ascii = (line.split("=", 1)[1] == "ascii")
+                        continue
                     if not line.strip():
                         continue
                     if "\t" in line:
@@ -183,6 +256,7 @@ class CoalescedTool:
                         clean = line
                     entries.append((bin_orig, clean.replace("/", os.sep)))
         else:
+            manifest_ascii = self.ascii_format
             entries = []
             for root, _, files in os.walk(input_dir):
                 for file in files:
@@ -204,10 +278,22 @@ class CoalescedTool:
                 else:
                     bin_path = "..\\..\\" + rel_path.replace("/", "\\")
 
-                # File name length (always NEG encoding for names)
-                out_f.write(struct.pack(">i", -(len(bin_path) + 1)))
-                out_f.write(bin_path.encode("utf-16le"))
-                out_f.write(b"\x00\x00")
+                if manifest_ascii:
+                    # POS / ASCII: byte count including null terminator
+                    # Fall back to NEG / UTF-16LE for non-Latin-1 characters
+                    try:
+                        encoded = bin_path.encode("latin-1") + b"\x00"
+                        out_f.write(struct.pack(">i", len(encoded)))
+                        out_f.write(encoded)
+                    except UnicodeEncodeError:
+                        out_f.write(struct.pack(">i", -(len(bin_path) + 1)))
+                        out_f.write(bin_path.encode("utf-16le"))
+                        out_f.write(b"\x00\x00")
+                else:
+                    # NEG / UTF-16LE
+                    out_f.write(struct.pack(">i", -(len(bin_path) + 1)))
+                    out_f.write(bin_path.encode("utf-16le"))
+                    out_f.write(b"\x00\x00")
 
                 # Parse ini file into sections and records
                 sections = []
@@ -237,33 +323,68 @@ class CoalescedTool:
                 out_f.write(struct.pack(">i", len(sections)))
 
                 for section_name, records in sections:
-                    # Section name length (NEG encoding)
-                    out_f.write(struct.pack(">i", -(len(section_name) + 1)))
-                    out_f.write(section_name.encode("utf-16le"))
-                    out_f.write(b"\x00\x00")
+                    if manifest_ascii:
+                        try:
+                            encoded = section_name.encode("latin-1") + b"\x00"
+                            out_f.write(struct.pack(">i", len(encoded)))
+                            out_f.write(encoded)
+                        except UnicodeEncodeError:
+                            out_f.write(struct.pack(">i", -(len(section_name) + 1)))
+                            out_f.write(section_name.encode("utf-16le"))
+                            out_f.write(b"\x00\x00")
+                    else:
+                        out_f.write(struct.pack(">i", -(len(section_name) + 1)))
+                        out_f.write(section_name.encode("utf-16le"))
+                        out_f.write(b"\x00\x00")
 
                     # Record count
                     out_f.write(struct.pack(">i", len(records)))
 
                     for key, value in records:
-                        # Key name length:
-                        # empty key = POS 0 (no data, no null terminator)
-                        # non-empty  = NEG encoding + UTF-16LE data + null terminator
-                        if len(key) == 0:
-                            out_f.write(struct.pack(">i", 0))
+                        if manifest_ascii:
+                            # Key
+                            if len(key) == 0:
+                                out_f.write(struct.pack(">i", 0))
+                            else:
+                                try:
+                                    encoded = key.encode("latin-1") + b"\x00"
+                                    out_f.write(struct.pack(">i", len(encoded)))
+                                    out_f.write(encoded)
+                                except UnicodeEncodeError:
+                                    out_f.write(struct.pack(">i", -(len(key) + 1)))
+                                    out_f.write(key.encode("utf-16le"))
+                                    out_f.write(b"\x00\x00")
+                            # Value
+                            if len(value) == 0:
+                                out_f.write(struct.pack(">i", 0))
+                            else:
+                                try:
+                                    encoded = value.encode("latin-1") + b"\x00"
+                                    out_f.write(struct.pack(">i", len(encoded)))
+                                    out_f.write(encoded)
+                                except UnicodeEncodeError:
+                                    out_f.write(struct.pack(">i", -(len(value) + 1)))
+                                    out_f.write(value.encode("utf-16le"))
+                                    out_f.write(b"\x00\x00")
                         else:
-                            out_f.write(struct.pack(">i", -(len(key) + 1)))
-                            out_f.write(key.encode("utf-16le"))
-                            out_f.write(b"\x00\x00")
-                        # Value length:
-                        # empty   = POS 0, no null terminator
-                        # nonzero = NEG encoding + data + null terminator
-                        if len(value) == 0:
-                            out_f.write(struct.pack(">i", 0))
-                        else:
-                            out_f.write(struct.pack(">i", -(len(value) + 1)))
-                            out_f.write(value.encode("utf-16le"))
-                            out_f.write(b"\x00\x00")
+                            # Key name length:
+                            # empty key = POS 0 (no data, no null terminator)
+                            # non-empty  = NEG encoding + UTF-16LE data + null terminator
+                            if len(key) == 0:
+                                out_f.write(struct.pack(">i", 0))
+                            else:
+                                out_f.write(struct.pack(">i", -(len(key) + 1)))
+                                out_f.write(key.encode("utf-16le"))
+                                out_f.write(b"\x00\x00")
+                            # Value length:
+                            # empty   = POS 0, no null terminator
+                            # nonzero = NEG encoding + data + null terminator
+                            if len(value) == 0:
+                                out_f.write(struct.pack(">i", 0))
+                            else:
+                                out_f.write(struct.pack(">i", -(len(value) + 1)))
+                                out_f.write(value.encode("utf-16le"))
+                                out_f.write(b"\x00\x00")
 
 def main():
     if len(sys.argv) < 3:
