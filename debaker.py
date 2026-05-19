@@ -82,6 +82,7 @@ class CoalescedTool:
             output_dir = os.path.join(output_dir, bin_name)
 
         os.makedirs(output_dir, exist_ok=True)
+        manifest_path = os.path.join(output_dir, "_manifest.txt")
 
         with open(input_file, "rb") as f:
             self.files = self.read_int_be(f)
@@ -98,20 +99,20 @@ class CoalescedTool:
                 self.secCount = self.read_int_be(f)
 
                 if self.nmlen > 0:
-                    normalized_path = self.fullpath.replace("/", "\\")
+                    # Normalize all separators to forward slashes first
+                    normalized_path = self.fullpath.replace("\\", "/")
 
-                    # Strip all leading "../" or "..\"
-                    while normalized_path.startswith("..\\") or normalized_path.startswith("../"):
-                        parts = (
-                            normalized_path.split("\\", 1)
-                            if "\\" in normalized_path
-                            else normalized_path.split("/", 1)
-                        )
+                    # Strip all leading "../" or "./"
+                    while normalized_path.startswith("../") or normalized_path.startswith("./"):
+                        parts = normalized_path.split("/", 1)
                         normalized_path = parts[1] if len(parts) > 1 else ""
 
-                    clean_path = normalized_path.lstrip("\\/")
+                    clean_path = normalized_path.lstrip("/")
                     full_output_path = os.path.join(output_dir, clean_path)
                     os.makedirs(os.path.dirname(full_output_path), exist_ok=True)
+
+                    with open(manifest_path, "a", encoding="utf-8") as manifest:
+                        manifest.write(self.fullpath + "\t" + clean_path + "\n")
 
                     with open(full_output_path, "w", encoding="utf-8") as out_file:
                         for sec_index in range(self.secCount):
@@ -138,7 +139,9 @@ class CoalescedTool:
                                     for _ in range(self.valueLength):
                                         char_bytes = f.read(2)
                                         if char_bytes == b"\n\x00":
-                                            value_chars.append("\u00B6")  # ¶ symbol
+                                            value_chars.append("\u00B6")  # ¶ = embedded newline
+                                        elif char_bytes == b"\r\x00":
+                                            value_chars.append("\u00B5")  # µ = embedded carriage return
                                         else:
                                             value_chars.append(char_bytes.decode("utf-16le"))
                                     f.seek(2, os.SEEK_CUR)  # skip null terminator
@@ -157,26 +160,46 @@ class CoalescedTool:
                 os.path.basename(input_dir) + ".BIN"
             )
 
-        # Gather extracted files
-        input_files = []
-        for root, _, files in os.walk(input_dir):
-            for file in files:
-                rel_path = os.path.relpath(os.path.join(root, file), input_dir)
-                input_files.append(rel_path)
+        # Gather extracted files, use manifest to preserve original order and paths
+        manifest_path = os.path.join(input_dir, "_manifest.txt")
+        if os.path.exists(manifest_path):
+            entries = []
+            with open(manifest_path, "r", encoding="utf-8") as mf:
+                for line in mf:
+                    line = line.rstrip("\n")
+                    if not line.strip():
+                        continue
+                    if "\t" in line:
+                        # original_bin_path<TAB>clean_relative_path
+                        bin_orig, clean = line.split("\t", 1)
+                    else:
+                        # Legacy format: reconstruct bin_path with default prefix
+                        bin_orig = None
+                        clean = line
+                    entries.append((bin_orig, clean.replace("/", os.sep)))
+        else:
+            entries = []
+            for root, _, files in os.walk(input_dir):
+                for file in files:
+                    rel_path = os.path.relpath(os.path.join(root, file), input_dir)
+                    entries.append((None, rel_path))
 
-        self.files = len(input_files)
+        self.files = len(entries)
 
         with open(output_file, "wb") as out_f:
             # File count
             out_f.write(struct.pack(">i", self.files))
 
-            for rel_path in input_files:
+            for bin_orig, rel_path in entries:
                 full_input_path = os.path.join(input_dir, rel_path)
 
-                # UE3 uses ..\..\ prefix
-                bin_path = "..\\..\\" + rel_path.replace("/", "\\")
+                # Use the exact original binary path if available; otherwise fall back
+                if bin_orig:
+                    bin_path = bin_orig
+                else:
+                    bin_path = "..\\..\\" + rel_path.replace("/", "\\")
 
-                # File name length
+                # File name length (always NEG encoding for names)
                 out_f.write(struct.pack(">i", -(len(bin_path) + 1)))
                 out_f.write(bin_path.encode("utf-16le"))
                 out_f.write(b"\x00\x00")
@@ -196,7 +219,8 @@ class CoalescedTool:
                             current_section = line[1:-1]
                         elif "=" in line:
                             key, value = line.split("=", 1)
-                            value = value.replace("¶", "\n")
+                            # Restore embedded newline/CR placeholders
+                            value = value.replace("\u00B6", "\n").replace("\u00B5", "\r")
                             current_records.append((key, value))
                         elif not line.strip():
                             continue
@@ -208,7 +232,7 @@ class CoalescedTool:
                 out_f.write(struct.pack(">i", len(sections)))
 
                 for section_name, records in sections:
-                    # Section name length
+                    # Section name length (NEG encoding)
                     out_f.write(struct.pack(">i", -(len(section_name) + 1)))
                     out_f.write(section_name.encode("utf-16le"))
                     out_f.write(b"\x00\x00")
@@ -217,14 +241,19 @@ class CoalescedTool:
                     out_f.write(struct.pack(">i", len(records)))
 
                     for key, value in records:
-                        # Key name length
+                        # Key name length (NEG encoding)
                         out_f.write(struct.pack(">i", -(len(key) + 1)))
                         out_f.write(key.encode("utf-16le"))
                         out_f.write(b"\x00\x00")
-                        # Value length
-                        out_f.write(struct.pack(">i", -(len(value) + 1)))
-                        out_f.write(value.encode("utf-16le"))
-                        out_f.write(b"\x00\x00")
+                        # Value length:
+                        # empty   = POS 0, no null terminator
+                        # nonzero = NEG encoding + data + null terminator
+                        if len(value) == 0:
+                            out_f.write(struct.pack(">i", 0))
+                        else:
+                            out_f.write(struct.pack(">i", -(len(value) + 1)))
+                            out_f.write(value.encode("utf-16le"))
+                            out_f.write(b"\x00\x00")
 
 def main():
     if len(sys.argv) < 3:
